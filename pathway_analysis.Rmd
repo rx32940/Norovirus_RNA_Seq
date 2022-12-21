@@ -1,0 +1,111 @@
+---
+title: "pathway_enrichment"
+author: "Rachel Xu"
+date: "11/10/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+path.path <- "/scicomp/home-pure/rwo8/workdir/rna_seq_oxy_bile_data_combined/string/"
+
+current_comparison <- "slide7_25HC_v_Ethol_noBile_GII.4"
+# current_comparison <- "slide8_25HC_v_Ethol_yesBile_GII.4"
+# current_comparison <- "slide11_noBile_v_yesBile_25HC_GII.4"
+
+input.path <- file.path(path.path, current_comparison)
+fig_path <- file.path(path.path, "figures")
+
+gene_list_immune <- c( "IFIT1", "ISG15","MX1", "MX2", "IFITM1", "DDX54", "DDX60")
+gene_list_choles <- c("CYP3A4", "CYP27A1", "ABCG1", "CH25H", "ABCA1" )
+gene_list <- c(gene_list_immune, gene_list_choles)
+```
+
+# bold to axis text
+```{r}
+
+colorado <- function(src, boulder) {
+  if (!is.factor(src)) src <- factor(src)                   # make sure it's a factor
+  src_levels <- levels(src)                                 # retrieve the levels in their order
+  brave <- boulder %in% src_levels                          # make sure everything we want to make bold is actually in the factor levels
+  if (all(brave)) {                                         # if so
+    b_pos <- purrr::map_int(boulder, ~which(.==src_levels)) # then find out where they are
+    b_vec <- rep("plain", length(src_levels))               # make'm all plain first
+    b_vec[b_pos] <- "bold"                                  # make our targets bold
+    b_vec                                                   # return the new vector
+  } else {
+    stop("All elements of 'boulder' must be in src")
+  }
+}
+
+
+```
+
+# read in the data table
+```{r}
+
+all_genes <- read.table(file.path(input.path, "input_rank_data_rank.txt"), sep="\t", header = TRUE)
+
+enriched_path <- read.table(file.path(input.path, "enrichment.all.tsv"), sep="\t")
+
+colnames(enriched_path) <- c("category","term ID","term description","genes mapped","enrichment score",	"direction","false discovery rate","method","matching proteins in your input (IDs)",	"matching proteins in your input (labels)"
+)
+
+```
+
+# plot enriched plot
+```{r}
+enriched_path_id <- c("Type i interferon signaling pathway")
+
+
+
+enriched_genes_str <- enriched_path %>% subset(`term description` %in% enriched_path_id) %>% dplyr::select(`matching proteins in your input (IDs)`) %>% unlist() %>% unname()
+
+enriched_genes <- unlist(strsplit(enriched_genes_str, split = ",", fixed = TRUE))
+
+enriched_genes_df <- all_genes %>% subset(stringId%in% enriched_genes)
+
+write.table(enriched_genes_df %>% dplyr::select(queryId) , file.path(input.path, "enriched.genes",paste0(enriched_path_id, "_genes.txt")), quote = FALSE, row.names = FALSE, col.names = FALSE, sep="\n")
+
+ggplot(data  = all_genes, aes(x = inputValueRank, y = inputValue))+
+  geom_vline(data = enriched_genes_df, aes(xintercept  = inputValueRank), alpha=.5)+
+    geom_line(color="red")+
+    theme_bw()
+```
+
+# plot dot plot
+```{r}
+library(org.Hs.eg.db)
+# bp_enrich_path <- enriched_path %>% subset(`false discovery rate` < 0.05) %>% subset(category == "GO Process") %>% arrange(desc(`enrichment score`)) %>% mutate(`-log(FDR)` = -log10(`false discovery rate`), num.genes.enriched=`genes mapped`) %>% mutate(regulation.direction = ifelse(direction == "top", "enriched.by.down-regulated.genes", ifelse(direction == "bottom", "enriched.by.up-regulated.genes", "enriched.at.both.ends"))) %>% mutate(GO.size = sapply(`term ID`,function(x){
+#   nrow(AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys=x, columns="ENSEMBL"))
+# }))
+# 
+# bp_enrich_path.1 <- bp_enrich_path 
+# 
+# write.table(bp_enrich_path.1, file.path(input.path, "enrichment_all_anot.tsv"), quote = FALSE, row.names = FALSE, sep="\t")
+
+bp_enrich_path.1 <- read.csv(file.path(input.path, "enrichment_all_anot.tsv"), sep="\t")%>% mutate(enriched_ls = sapply(`matching.proteins.in.your.input..labels.`, function(x){
+  unlist(strsplit(x, ",", fixed = TRUE))
+})) %>% mutate(`percent.GO.enriched.(%)` = (num.genes.enriched/GO.size)*100)
+
+interested_pathway <- bp_enrich_path.1 %>% mutate(interested = sapply(enriched_ls, function(x){
+  ifelse(length(intersect(x, gene_list))>0, "yes", "no")
+})) %>% subset(interested == "yes") %>% dplyr::select(`term.description`) %>% unlist()
+
+pp <- ggplot(bp_enrich_path.1)+
+  geom_point(aes(x=`enrichment.score`, y=`term.description`, size=`percent.GO.enriched.(%)`, color=regulation.direction))+
+  scale_color_manual(values=c("black", "blue", "orange"))+
+  labs(y="Enriched GO biological processes (BP)")+
+  theme_bw()+
+  theme(axis.text.y = element_text(face=colorado(bp_enrich_path$`term description`, interested_pathway)))
+pp
+# ggsave(file.path(fig_path, paste0(current_comparison, ".tiff")), pp,dpi = 500, width = 12, height = 13)
+```
+
+`

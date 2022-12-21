@@ -1,0 +1,1800 @@
+---
+title: "rna_seq_treatment_bile"
+author: "Rachel Xu"
+date: "7/12/2022"
+output: html_document
+---
+# MUST ACTIVATE CONDA ENV IN TERMINAL "conda activate deseq2"
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# set up input path and read in samples'metadata
+```{r}
+
+library(tximeta)
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(readr)
+
+main_path <- "/scicomp/home-pure/rwo8/workdir/rna_seq_oxy_bile_data_combined"
+salmon_input <- file.path(main_path, "salmon")
+fig_path <- file.path(main_path, "output", "figures")
+tab_path <- file.path(main_path, "output", "tables")
+samples <- list.dirs(salmon_input, full.names = FALSE, recursive = FALSE)
+
+metadata_oxy_bile <- read.csv(file.path(main_path, "info", "metadata_from_sample_name.csv"))  %>% dplyr::rename(names = new_sample_name)
+
+# genes of interest
+gene_list_immune <- c( "IFIT1", "ISG15","MX1", "MX2", "IFITM1", "DDX54", "DDX60")
+gene_list_choles <- c("CYP3A4", "CYP27A1", "ABCG1", "CH25H", "ABCA1" )
+gene_list <- c(gene_list_immune, gene_list_choles)
+
+metadata_oxy_bile
+```
+### an add flag function to only label genes on the heatmap that you want to label
+https://stackoverflow.com/questions/52599180/partial-row-labels-heatmap-r
+
+### an make_bold_names function to bold some rownames/colnames in heatmap
+https://github.com/raivokolde/pheatmap/issues/48
+```{r}
+
+
+add.flag <- function(pheatmap,
+                     kept.labels,
+                     repel.degree) {
+
+  # repel.degree = number within [0, 1], which controls how much 
+  #                space to allocate for repelling labels.
+  ## repel.degree = 0: spread out labels over existing range of kept labels
+  ## repel.degree = 1: spread out labels over the full y-axis
+
+  heatmap <- pheatmap$gtable
+
+  new.label <- heatmap$grobs[[which(heatmap$layout$name == "row_names")]] 
+
+  # keep only labels in kept.labels, replace the rest with ""
+  new.label$label <- ifelse(new.label$label %in% kept.labels, 
+                            new.label$label, "")
+
+  # calculate evenly spaced out y-axis positions
+  repelled.y <- function(d, d.select, k = repel.degree){
+    # d = vector of distances for labels
+    # d.select = vector of T/F for which labels are significant
+
+    # recursive function to get current label positions
+    # (note the unit is "npc" for all components of each distance)
+    strip.npc <- function(dd){
+      if(!"unit.arithmetic" %in% class(dd)) {
+        return(as.numeric(dd))
+      }
+
+      d1 <- strip.npc(dd$arg1)
+      d2 <- strip.npc(dd$arg2)
+      fn <- dd$fname
+      return(lazyeval::lazy_eval(paste(d1, fn, d2)))
+    }
+
+    full.range <- sapply(seq_along(d), function(i) strip.npc(d[i]))
+    selected.range <- sapply(seq_along(d[d.select]), function(i) strip.npc(d[d.select][i]))
+
+    return(unit(seq(from = max(selected.range) + k*(max(full.range) - max(selected.range)),
+                    to = min(selected.range) - k*(min(selected.range) - min(full.range)), 
+                    length.out = sum(d.select)), 
+                "npc"))
+  }
+  new.y.positions <- repelled.y(new.label$y,
+                                d.select = new.label$label != "")
+  new.flag <- segmentsGrob(x0 = new.label$x,
+                           x1 = new.label$x + unit(0.15, "npc"),
+                           y0 = new.label$y[new.label$label != ""],
+                           y1 = new.y.positions)
+
+  # shift position for selected labels
+  new.label$x <- new.label$x + unit(0.2, "npc")
+  new.label$y[new.label$label != ""] <- new.y.positions
+
+  # add flag to heatmap
+  heatmap <- gtable::gtable_add_grob(x = heatmap,
+                                   grobs = new.flag,
+                                   t = 4, 
+                                   l = 4
+  )
+
+  # replace label positions in heatmap
+  heatmap$grobs[[which(heatmap$layout$name == "row_names")]] <- new.label
+
+  # plot result
+  grid.newpage()
+  grid.draw(heatmap)
+
+  # return a copy of the heatmap invisibly
+  invisible(heatmap)
+}
+
+
+library(tidyverse)
+
+# use this function to make row or column names bold
+# parameters:
+#   mat: the matrix passed to pheatmap
+#   rc_fun: either rownames or colnames
+#   rc_names: vector of names that should appear in boldface
+make_bold_names <- function(mat, rc_fun, rc_names) {
+  bold_names <- rc_fun(mat)
+  ids <- rc_names %>% match(rc_fun(mat))
+  ids %>%
+    walk(
+      function(i)
+        bold_names[i] <<-
+        bquote(bold(.(rc_fun(mat)[i]))) %>%
+        as.expression()
+    )
+  bold_names
+}
+
+```
+
+
+## 1) First Comparison: Uninfected vs. Infected - w/ or w/o Bile
+- since all **uninfected** samples were **untreated**, we will only use **untreated infected** samples in this formula
+```{r}
+pretreat <- "untreated" # untreated or 25 HC
+bile <- "yes"
+
+
+metadate_filter <- metadata_oxy_bile %>% subset(pretreatment == pretreat & Bile == bile)
+samples_filtered <- samples[samples %in% metadate_filter$names]
+
+sample.number = seq(1,length(samples_filtered),1)
+
+metadata_oxy_bile$infection <- factor(metadata_oxy_bile$infection, levels = c("uninfected","GII.4")) 
+metadata_oxy_bile$Bile <- factor(metadata_oxy_bile$Bile, levels = c("no","yes")) 
+
+metadate_filter
+```
+
+### 1) check transcript quantification file exist
+```{r}
+
+trans.quant.files <- file.path(salmon_input, samples_filtered, "quant.sf")
+all(file.exists(trans.quant.files))
+```
+### 1) read gene quantification into R
+```{r}
+
+
+coldata <- data.frame(files = trans.quant.files) %>% mutate(names = sapply(files, function(x){
+  s <-  unlist(strsplit(x, "/", fixed=TRUE))
+  s[length(s)-1]
+}))
+
+
+
+coldata_anot <- left_join(coldata, metadata_oxy_bile, by="names", stringAsFactors=FALSE)
+
+se <- tximeta(coldata_anot)
+
+# retrieveDb(se)
+# colData(se)
+# assayNames(se)
+# seqinfo(se)
+rowRanges(se)
+```
+
+### 1) summarise transcript expression to gene expression
+```{r}
+
+gse <- summarizeToGene(se)
+
+ddsTxi <- DESeqDataSet(gse, ~ infection)
+
+```
+
+
+
+### 1) deseq pca
+```{r}
+rlg <- rlog(ddsTxi, blind = TRUE)
+
+deseq_pca <- plotPCA(rlg, returnData = TRUE, intgroup=c("infection"))
+
+percentVar <- round(100 * attr(deseq_pca, "percentVar"))
+
+
+pcap<- ggplot(deseq_pca, aes(x=PC1, PC2, color=infection, label=name))+
+  geom_point(size=4)+
+  theme_bw()+
+  
+  xlab(paste0("PC1 (",percentVar[1],"%)")) +
+  ylab(paste0("PC2 (",percentVar[2],"%)")) 
+pcap
+ggsave(file.path(fig_path, paste0("uninfected_vs_infected_untreated_" ,bile ,"Bile_pca_deseq.tiff")), pcap, dpi=300, height = 5, width = 7)
+
+# plotly::ggplotly(pcap)
+```
+
+### 1.1) DESeq analysis
+```{r}
+contrast <- c("infection",  "GII.4","uninfected")
+
+contrast_str <- paste(contrast[1], contrast[2], "vs",contrast[3], sep="_")
+
+dds.deseq <- DESeq(ddsTxi, test="Wald")
+
+resultsNames(dds.deseq)
+
+res <- DESeq2::results(dds.deseq,contrast = contrast,independentFiltering = TRUE, alpha =0.05, pAdjustMethod = "BH")
+
+plotDispEsts(dds.deseq)
+```
+
+### 1.1) difference at individual time point
+```{r}
+contrast_str %in% resultsNames(dds.deseq)
+
+resLFC <- lfcShrink(dds.deseq, coef = paste0(contrast_str, collapse = "_"),type="apeglm", res=res)
+
+plotDispEsts(dds.deseq)
+
+
+resLFCordered <- resLFC[order(resLFC$padj) & !is.na(resLFC$padj),]
+summary(resLFCordered, alpha=0.05)
+sum(resLFCordered$padj < 0.05, na.rm =TRUE)
+nrow(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1 & !is.na(resLFCordered$padj),])
+
+```
+
+### get gene info for DE genes
+```{r}
+
+options(connectionObserver = NULL)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+columns(org.Hs.eg.db)
+
+ens.str <- rownames(resLFCordered)
+
+resLFCordered$symbol <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="SYMBOL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+resLFCordered$ENSEMBL <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="ENSEMBL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+head(resLFCordered,2)
+
+
+```
+
+### 1.1) write DE genes to file
+```{r}
+deseqDF <- as.data.frame(resLFCordered) %>% rownames_to_column() 
+gene_count <- data.frame(assay(ddsTxi)) %>% rownames_to_column()
+
+de_genes_write_df <- left_join(gene_count, deseqDF, by="rowname")%>% mutate(FoldChange = 2^log2FoldChange) %>% arrange(padj) %>% dplyr::select(-c(ENSEMBL))%>% dplyr::rename(ENSEMBL=rowname) 
+
+write.csv(de_genes_write_df, file.path(tab_path, paste0("uninfected_vs_infected_untreated_" ,bile ,"Bile_DE_genes.csv")))
+
+
+gene_count %>% subset(rowname == "ENSG00000137869")
+```
+
+### 1.1) plot MA 
+```{r}
+
+library(ggplot2)
+library(scales)
+library(edgeR)
+
+deseqDF <- as.data.frame(resLFCordered)
+
+
+head(deseqDF,2)
+
+deseqDF$significant <- ifelse(deseqDF$padj < 0.05 , "Sig", "Non-Sig") 
+
+ggplot(deseqDF, aes(log2(cpm(baseMean)), log2FoldChange, color=significant))+
+  geom_point(size=1)+
+  geom_hline(yintercept = 0, color="gray", size=1.5)+
+  scale_color_manual(values=c("gray", "purple"))
+
+```
+
+### 1.1) volcano plot
+
+```{r}
+
+
+deseqDF <- as.data.frame(resLFCordered)
+
+deseqDF$Comparison <- "Not significant"
+
+deseqDF$Comparison[deseqDF$log2FoldChange > 1 & deseqDF$padj < 0.05] <- "Up-regulated"
+deseqDF$Comparison[deseqDF$log2FoldChange < -1 & deseqDF$padj < 0.05] <- "Down-regulated"
+
+deseqDF[deseqDF$Comparison != "Not significant",]
+
+deseqDF$Comparison <- factor(deseqDF$Comparison, levels = c("Not significant",  "Up-regulated","Down-regulated"))
+
+gene_list <- c("CYP3A4", "IFIT1", "IFIT2", "IFIT5", "OAS2", "MX1")
+
+deseqDF$delabel2 <- NA
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[c(deseqDF$symbol %in% gene_list ),]$delabel2 <- deseqDF[c(deseqDF$symbol %in% gene_list ),]$symbol
+
+deseqDF$delabel <- NA
+high_change <- 7
+high_padj <- 1e-10
+gene_high <- deseqDF %>% subset(abs(log2FoldChange) >high_change | padj < high_padj) %>% dplyr::select(symbol) %>% unlist()
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) & (!deseqDF$symbol %in% gene_list),]$delabel <- deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) & (!deseqDF$symbol %in% gene_list),]$symbol
+
+
+library(ggrepel)
+vp <-ggplot(deseqDF, aes(x = log2FoldChange, y = -log10(padj), color=Comparison, label=symbol))+
+  geom_point()+
+  theme_bw()+
+  geom_vline(xintercept = c(-1,1), col="gray", linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), col="gray", linetype = "dashed")+
+    scale_color_manual(values = c("gray", "orange","purple"))+
+  geom_text_repel(aes(label=delabel), color="black")+
+  geom_text_repel(aes(label=delabel2), color="black")+
+  theme(axis.text = element_text(size=12))
+
+vp
+ggsave(file.path(fig_path, paste0("uninfected_vs_infected_untreated_" ,bile ,"Bile_volcano.tiff")), vp, height = 7, width = 9, dpi=300)
+
+
+```
+
+
+### 1.1) plot heatmap
+
+
+
+```{r}
+library(pheatmap)
+library(DESeq2)
+library(gridExtra)
+library(grid)
+library(seriation)
+library(dendextend)
+
+rld <- vst(dds.deseq, blind=FALSE)
+
+DE_genes <- rownames(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1,])
+m <- assay(rld)[rownames(assay(rld)) %in% DE_genes,]
+topVarGenes <- head(order(rowVars(m), decreasing=TRUE),50)
+m1 <- m[topVarGenes,]
+
+
+m_anot<- left_join(as.data.frame(m1) %>% rownames_to_column(), data.frame(resLFCordered)%>% rownames_to_column(), by="rowname") %>% mutate(label = paste0(symbol, "(", ENSEMBL,")")) %>% subset(!is.na(symbol))
+rownames(m_anot) <- m_anot$label
+m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol" ,"ENSEMBL", "label"))
+
+# m_anot <- m_anot %>% group_by(symbol) %>% mutate(symbol_2 = 1:n()) %>% mutate(symbol_2 = ifelse(symbol_2==1, "", paste0("-dup", symbol_2))) %>% mutate(symbol_3 = paste0(symbol, symbol_2)) %>% as.data.frame()
+# rownames(m_anot) <- m_anot$symbol_3
+# m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol","symbol_2","symbol_3" ,"ENSEMBL", "label"))
+
+heat_matrix <- as.matrix(m_anot_df)
+ 
+anot_table<- metadata_oxy_bile %>% column_to_rownames(var="names") %>% dplyr::select(c("infection", "Bile"))
+
+tiff(file.path(fig_path, paste0("uninfected_vs_infected_untreated_" ,bile ,"Bile_heatmap.tiff")), width = 2500, height=2500,res=300)
+# tiff(file.path(fig_path, paste0(oxy, "vuntreated_",vir, "_DEgenes_heatmap.tiff")), width = 2000, height=1500,res=300)
+
+heat <- pheatmap(heat_matrix, annotation = anot_table, color = c(RColorBrewer::brewer.pal(8,"Blues")[c(8,5,3)],RColorBrewer::brewer.pal(8,"YlOrRd")), fontsize_row=7, silent = TRUE)
+
+col_dend <- heat[[2]]
+col_dend <- rotate(col_dend, order = rev(colnames(heat_matrix)[get_order(col_dend)]))
+
+# The pheatmap with the same clustering of heatmaply
+pheatmap(heat_matrix, cluster_cols=as.hclust(col_dend), annotation = anot_table, color = c(rev(RColorBrewer::brewer.pal(8,"Blues"))[c(3,5,8)],RColorBrewer::brewer.pal(8,"YlOrRd")), fontsize_row=7)
+
+# add.flag(heat,kept.labels = gene_list,repel.degree = 0.3)
+
+dev.off()
+
+
+```
+
+## 2) Second Comparison: pretreatment (25HC or ethanol vs. untreated) - w/ or w/o Bile - infected
+- since all **uninfected** samples were **untreated**, we will only use **untreated infected** samples in this formula
+```{r}
+pretreat <- "25HC" # ethanol or 25HC
+bile <- "no"
+
+
+metadate_filter <- metadata_oxy_bile %>% subset(c(pretreatment == pretreat|pretreatment == "untreated") & Bile == bile & infection == "GII.4")
+samples_filtered <- samples[samples %in% metadate_filter$names]
+
+sample.number = seq(1,length(samples_filtered),1)
+
+metadata_oxy_bile$infection <- factor(metadata_oxy_bile$infection, levels = c("uninfected","GII.4")) 
+metadata_oxy_bile$pretreatment <- factor(metadata_oxy_bile$pretreatment, levels = c("untreated","25HC", "ethanol")) 
+metadata_oxy_bile$Bile <- factor(metadata_oxy_bile$Bile, levels = c("no","yes")) 
+
+metadate_filter
+```
+
+### 2) check transcript quantification file exist
+```{r}
+
+trans.quant.files <- file.path(salmon_input, samples_filtered, "quant.sf")
+all(file.exists(trans.quant.files))
+```
+### 2) read gene quantification into R
+```{r}
+
+library(tximeta)
+library(DESeq2)
+
+coldata <- data.frame(files = trans.quant.files) %>% mutate(names = sapply(files, function(x){
+  s <-  unlist(strsplit(x, "/", fixed=TRUE))
+  s[length(s)-1]
+}))
+
+
+
+coldata_anot <- left_join(coldata, metadata_oxy_bile, by="names", stringAsFactors=FALSE)
+
+se <- tximeta(coldata_anot)
+
+# retrieveDb(se)
+# colData(se)
+# assayNames(se)
+# seqinfo(se)
+rowRanges(se)
+```
+
+### 2) summarise transcript expression to gene expression
+```{r}
+
+gse <- summarizeToGene(se)
+
+ddsTxi <- DESeqDataSet(gse, ~ pretreatment)
+
+```
+
+
+
+### 2) deseq pca
+```{r}
+rlg <- rlog(ddsTxi, blind = TRUE)
+
+deseq_pca <- plotPCA(rlg, returnData = TRUE, intgroup=c("pretreatment"))
+
+percentVar <- round(100 * attr(deseq_pca, "percentVar"))
+
+
+pcap<- ggplot(deseq_pca, aes(x=PC1, PC2, color=pretreatment, label=name))+
+  geom_point(size=4)+
+  theme_bw()+
+  xlab(paste0("PC1 (",percentVar[1],"%)")) +
+  ylab(paste0("PC2 (",percentVar[2],"%)")) 
+pcap
+ggsave(file.path(fig_path, paste0(pretreat, "_vs_untreated_",bile ,"Bile_infected_pca_deseq.tiff")), pcap, dpi=300, height = 5, width = 7)
+
+# plotly::ggplotly(pcap)
+```
+
+### 2.1) DESeq analysis
+```{r}
+contrast <- c("pretreatment", pretreat,"untreated")
+
+contrast_str <- paste(contrast[1], contrast[2], "vs",contrast[3], sep="_")
+
+dds.deseq <- DESeq(ddsTxi, test="Wald")
+
+resultsNames(dds.deseq)
+
+res <- DESeq2::results(dds.deseq,contrast = contrast,independentFiltering = TRUE, alpha =0.05, pAdjustMethod = "BH")
+
+plotDispEsts(dds.deseq)
+```
+
+### 2.1) difference at individual time point
+```{r}
+contrast_str %in% resultsNames(dds.deseq)
+
+resLFC <- lfcShrink(dds.deseq, coef = paste0(contrast_str, collapse = "_"),type="apeglm", res=res)
+
+plotDispEsts(dds.deseq)
+
+
+resLFCordered <- resLFC[order(resLFC$padj) & !is.na(resLFC$padj),]
+summary(resLFCordered, alpha=0.05)
+sum(resLFCordered$padj < 0.05, na.rm =TRUE)
+nrow(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1 & !is.na(resLFCordered$padj),])
+
+```
+
+### get gene info for DE genes
+```{r}
+
+options(connectionObserver = NULL)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+columns(org.Hs.eg.db)
+
+ens.str <- rownames(resLFCordered)
+
+resLFCordered$symbol <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="SYMBOL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+resLFCordered$ENSEMBL <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="ENSEMBL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+head(resLFCordered,2)
+
+
+```
+
+### 2.1) write DE genes to file
+```{r}
+deseqDF <- as.data.frame(resLFCordered) %>% rownames_to_column() 
+gene_count <- data.frame(assay(ddsTxi)) %>% rownames_to_column()
+
+de_genes_write_df <- left_join(gene_count, deseqDF, by="rowname")%>% mutate(FoldChange = 2^log2FoldChange) %>% arrange(padj) %>% dplyr::select(-c(ENSEMBL))%>% dplyr::rename(ENSEMBL=rowname) 
+
+write.csv(de_genes_write_df, file.path(tab_path, paste0(pretreat, "_vs_untreated_",bile ,"Bile_DE_genes.csv")))
+
+
+gene_count %>% subset(rowname == "ENSG00000137869")
+```
+
+### ADD: 25HC pre-treatment DE genes with/without Bile VENN Diagram -vs. untreated
+```{r}
+# file.path(tab_path, paste0(pretreat, "_vs_untreated_",bile ,"Bile_DE_genes.csv"))
+# 
+# ################## read DE genes results from analysis ########################
+# withBile <- read_csv("/scicomp/home-pure/rwo8/workdir/rna_seq_oxy_bile_data_combined/output/tables/25HC_vs_untreated_yesBile_DE_genes.csv")
+# 
+# noBile <- read_csv( "/scicomp/home-pure/rwo8/workdir/rna_seq_oxy_bile_data_combined/output/tables/25HC_vs_untreated_noBile_DE_genes.csv")
+# 
+# ################## obtain DE genes ######################################################
+# up_with <- withBile %>% subset(padj < 0.05 & log2FoldChange > 1)
+# up_no <- noBile %>% subset(padj < 0.05 & log2FoldChange > 1)
+# 
+# down_with <- withBile %>% subset(padj < 0.05 & log2FoldChange < -1)
+# down_no <- noBile %>% subset(padj < 0.05 & log2FoldChange < -1)
+# 
+# ################## get up-regulated genes intersected/distinct in bile vs. no Bile ##############################
+# int_with_up <- up_no %>% subset(ENSEMBL %in% intersect(up_with$ENSEMBL, up_no$ENSEMBL))
+# print(int_with_up$symbol)
+# 
+# noBile_up_unique <- up_no %>% subset(!ENSEMBL %in% intersect(up_with$ENSEMBL, up_no$ENSEMBL))
+# print(noBile_up_unique$symbol)
+# 
+# withBile_up_unique <- up_with %>% subset(!ENSEMBL %in% intersect(up_with$ENSEMBL, up_no$ENSEMBL))
+# print(withBile_up_unique$symbol)
+# 
+# ################## get down-regulated genes intersected/distinct in bile vs. no Bile ############################
+# 
+# int_with_down <- withBile %>% subset(ENSEMBL %in% intersect(down_with$ENSEMBL, down_no$ENSEMBL))
+# print(int_with_down$symbol)
+# 
+# noBile_down_unique <- down_no %>% subset(!ENSEMBL %in% intersect(down_with$ENSEMBL, down_no$ENSEMBL))
+# print(noBile_down_unique$symbol)
+# 
+# withBile_down_unique <- down_with %>% subset(!ENSEMBL %in% intersect(down_with$ENSEMBL, down_no$ENSEMBL))
+# print(withBile_down_unique$symbol)
+# 
+# 
+# ################## plot venn diagram ############################
+# 
+# library(ggvenn)
+# library("venneuler")
+# library("VennDiagram")
+# 
+# tiff(file.path(fig_path, "upregulate_bile_vs_noBile_25HC_GII4_VENN.tiff"))
+# grid.newpage() 
+# p <- VennDiagram::draw.pairwise.venn(area1  = length(up_with$ENSEMBL),area2 = length(up_no$ENSEMBL), cross.area = length(intersect(up_with$ENSEMBL, up_no$ENSEMBL)), fill = c( "lightblue", "orange"), category = c("with Bile", "w/o Bile"), lty = "blank", print.mode=c("raw", "percent"), alpha = 0.5, cat.pos=c(180, 180))
+# grid.draw(p)
+# dev.off()
+# 
+# tiff(file.path(fig_path, "downregulate_bile_vs_noBile_25HC_GII4_VENN.tiff"))
+# grid.newpage() 
+# p <- VennDiagram::draw.pairwise.venn(area1  = length(down_with$ENSEMBL),area2 = length(down_no$ENSEMBL), cross.area = length(intersect(down_with$ENSEMBL, down_no$ENSEMBL)), fill = c("lightblue", "orange"), category = c("with Bile", "w/o Bile"),  lty = "blank", print.mode=c("raw", "percent"), cat.pos=c(180, 180))
+# grid.draw(p)
+# dev.off()
+
+```
+
+### 2.1) plot MA 
+```{r}
+
+library(ggplot2)
+library(scales)
+library(edgeR)
+
+deseqDF <- as.data.frame(resLFCordered)
+
+
+head(deseqDF,2)
+
+deseqDF$significant <- ifelse(deseqDF$padj < 0.05 , "Sig", "Non-Sig") 
+
+ggplot(deseqDF, aes(log2(cpm(baseMean)), log2FoldChange, color=significant))+
+  geom_point(size=1)+
+  geom_hline(yintercept = 0, color="gray", size=1.5)+
+  scale_color_manual(values=c("gray", "purple"))
+
+```
+
+### 2.1) volcano plot
+
+```{r}
+
+
+deseqDF <- as.data.frame(resLFCordered)
+
+deseqDF$Comparison <- "Not significant"
+
+deseqDF$Comparison[deseqDF$log2FoldChange > 1 & deseqDF$padj < 0.05] <- "Up-regulated"
+deseqDF$Comparison[deseqDF$log2FoldChange < -1 & deseqDF$padj < 0.05] <- "Down-regulated"
+
+deseqDF[deseqDF$Comparison != "Not significant",]
+
+deseqDF$Comparison <- factor(deseqDF$Comparison, levels = c("Not significant",  "Up-regulated","Down-regulated"))
+
+gene_list <- c("CYP3A4", "IFIT1", "IFIT2", "IFIT5", "OAS2", "MX1")
+
+deseqDF$delabel2 <- NA
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[c(deseqDF$symbol %in% gene_list ),]$delabel2 <- deseqDF[c(deseqDF$symbol %in% gene_list ),]$symbol
+
+deseqDF$delabel <- NA
+high_change <- 5
+high_padj <- 1e-50
+gene_high <- deseqDF %>% subset(abs(log2FoldChange) >high_change | padj < high_padj) %>% dplyr::select(symbol) %>% unlist()
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) | (deseqDF$symbol %in% gene_list),]$delabel <- deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) | (deseqDF$symbol %in% gene_list),]$symbol
+
+
+library(ggrepel)
+vp <-ggplot(deseqDF, aes(x = log2FoldChange, y = -log10(padj), color=Comparison, label=symbol))+
+  geom_point()+
+  theme_bw()+
+  geom_vline(xintercept = c(-1,1), col="gray", linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), col="gray", linetype = "dashed")+
+    scale_color_manual(values = c("gray", "orange","purple"))+
+  geom_text_repel(aes(label=delabel), color="black")+
+  theme(axis.text = element_text(size=12))
+
+vp
+ggsave(file.path(fig_path, paste0(pretreat, "_vs_untreated_",bile ,"Bile_infected_volcano.tiff")), vp, height = 7, width = 9, dpi=300)
+
+
+```
+
+
+### 2.1) plot heatmap
+
+
+
+```{r}
+library(pheatmap)
+library(DESeq2)
+library(gridExtra)
+library(grid)
+library(seriation)
+library(dendextend)
+
+rld <- vst(dds.deseq, blind=FALSE)
+
+DE_genes <- rownames(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1,])
+m <- assay(rld)[rownames(assay(rld)) %in% DE_genes,]
+topVarGenes <- head(order(rowVars(m), decreasing=TRUE),50)
+m1 <- m[topVarGenes,]
+
+
+m_anot<- left_join(as.data.frame(m1) %>% rownames_to_column(), data.frame(resLFCordered)%>% rownames_to_column(), by="rowname") %>% mutate(label = paste0(symbol, "(", ENSEMBL,")")) %>% subset(!is.na(symbol))
+rownames(m_anot) <- m_anot$label
+m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol" ,"ENSEMBL", "label"))
+
+# m_anot <- m_anot %>% group_by(symbol) %>% mutate(symbol_2 = 1:n()) %>% mutate(symbol_2 = ifelse(symbol_2==1, "", paste0("-dup", symbol_2))) %>% mutate(symbol_3 = paste0(symbol, symbol_2)) %>% as.data.frame()
+# rownames(m_anot) <- m_anot$symbol_3
+# m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol","symbol_2","symbol_3" ,"ENSEMBL", "label"))
+
+heat_matrix <- as.matrix(m_anot_df)
+ 
+anot_table<- metadata_oxy_bile %>% column_to_rownames(var="names") %>% dplyr::select(c("pretreatment", "Bile"))
+
+tiff(file.path(fig_path, paste0(pretreat, "_vs_untreated_",bile ,"Bile_infected_heatmap.tiff")), width = 2500, height=2500,res=300)
+# tiff(file.path(fig_path, paste0(oxy, "vuntreated_",vir, "_DEgenes_heatmap.tiff")), width = 2000, height=1500,res=300)
+
+# The pheatmap with the same clustering of heatmaply
+heat <- pheatmap(heat_matrix,annotation = anot_table, color = c(rev(RColorBrewer::brewer.pal(8,"Blues"))[c(3,5,8)],RColorBrewer::brewer.pal(8,"YlOrRd")), fontsize_row=7)
+
+# add.flag(heat,kept.labels = c(gene_list_immune, gene_list_choles),repel.degree = 0.3)
+
+dev.off()
+
+
+```
+## 3) Third Comparison: compare pretreatment with each other (25HC vs ethanol) - w/ or w/o Bile - infected
+
+```{r}
+bile <- "yes"
+
+
+metadate_filter <- metadata_oxy_bile %>% subset(c(pretreatment == "ethanol"|pretreatment == "25HC") & Bile == bile & infection == "GII.4")
+samples_filtered <- samples[samples %in% metadate_filter$names]
+
+sample.number = seq(1,length(samples_filtered),1)
+
+metadata_oxy_bile$infection <- factor(metadata_oxy_bile$infection, levels = c("uninfected","GII.4")) 
+metadata_oxy_bile$pretreatment <- factor(metadata_oxy_bile$pretreatment, levels = c("untreated", "ethanol","25HC")) 
+metadata_oxy_bile$Bile <- factor(metadata_oxy_bile$Bile, levels = c("no","yes")) 
+
+
+```
+
+### 3) check transcript quantification file exist
+```{r}
+
+trans.quant.files <- file.path(salmon_input, samples_filtered, "quant.sf")
+all(file.exists(trans.quant.files))
+```
+### 3) read gene quantification into R
+```{r}
+
+library(tximeta)
+library(DESeq2)
+
+coldata <- data.frame(files = trans.quant.files) %>% mutate(names = sapply(files, function(x){
+  s <-  unlist(strsplit(x, "/", fixed=TRUE))
+  s[length(s)-1]
+}))
+
+
+
+coldata_anot <- left_join(coldata, metadata_oxy_bile, by="names", stringAsFactors=FALSE)
+
+se <- tximeta(coldata_anot)
+
+# retrieveDb(se)
+# colData(se)
+# assayNames(se)
+# seqinfo(se)
+rowRanges(se)
+```
+
+### 3) summarise transcript expression to gene expression
+```{r}
+
+gse <- summarizeToGene(se)
+
+ddsTxi <- DESeqDataSet(gse, ~ pretreatment)
+
+```
+### 3) deseq pca
+```{r}
+rlg <- rlog(ddsTxi, blind = TRUE)
+
+deseq_pca <- plotPCA(rlg, returnData = TRUE, intgroup=c("pretreatment"))
+
+percentVar <- round(100 * attr(deseq_pca, "percentVar"))
+
+
+pcap<- ggplot(deseq_pca, aes(x=PC1, PC2, color=pretreatment, label=name))+
+  geom_point(size=4)+
+  theme_bw()+
+  xlab(paste0("PC1 (",percentVar[1],"%)")) +
+  ylab(paste0("PC2 (",percentVar[2],"%)")) 
+pcap
+# ggsave(file.path(fig_path, paste0("25HC_vs_ethanol_",bile ,"Bile_infected_pca_deseq.tiff")), pcap, dpi=300, height = 5, width = 7)
+
+# plotly::ggplotly(pcap)
+```
+
+### 3.1) DESeq analysis
+```{r}
+contrast <- c("pretreatment", "25HC","ethanol")
+
+contrast_str <- paste(contrast[1], contrast[2], "vs",contrast[3], sep="_")
+
+dds.deseq <- DESeq(ddsTxi, test="Wald")
+
+resultsNames(dds.deseq)
+
+res <- DESeq2::results(dds.deseq,contrast = contrast,independentFiltering = TRUE, alpha =0.05, pAdjustMethod = "BH")
+
+plotDispEsts(dds.deseq)
+```
+
+### 3.1) difference at individual time point
+```{r}
+contrast_str %in% resultsNames(dds.deseq)
+
+resLFC <- lfcShrink(dds.deseq, coef = paste0(contrast_str, collapse = "_"),type="apeglm", res=res)
+
+plotDispEsts(dds.deseq)
+
+
+resLFCordered <- resLFC[order(resLFC$padj) & !is.na(resLFC$padj),]
+summary(resLFCordered, alpha=0.05)
+sum(resLFCordered$padj < 0.05, na.rm =TRUE)
+nrow(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1 & !is.na(resLFCordered$padj),])
+
+```
+
+### get gene info for DE genes
+```{r}
+
+options(connectionObserver = NULL)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+columns(org.Hs.eg.db)
+
+ens.str <- rownames(resLFCordered)
+
+resLFCordered$symbol <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="SYMBOL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+resLFCordered$ENSEMBL <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="ENSEMBL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+head(resLFCordered,2)
+
+
+```
+
+### 3.1) write DE genes to file
+```{r}
+deseqDF <- as.data.frame(resLFCordered) %>% rownames_to_column() 
+gene_count <- data.frame(assay(ddsTxi)) %>% rownames_to_column()
+
+de_genes_write_df <- left_join(gene_count, deseqDF, by="rowname")%>% mutate(FoldChange = 2^log2FoldChange) %>% arrange(padj) %>% dplyr::select(-c(ENSEMBL))%>% dplyr::rename(ENSEMBL=rowname) 
+
+write.csv(de_genes_write_df, file.path(tab_path, paste0("25HC_vs_ethanol_",bile ,"Bile_infected_DE_genes.csv")))
+
+
+gene_count %>% subset(rowname == "ENSG00000137869")
+```
+
+### ADD: 25HC pre-treatment DE genes with/without Bile VENN Diagram - vs. ethanol
+```{r}
+file.path(tab_path, paste0("25HC_vs_ethanol_",bile ,"Bile_infected_DE_genes.csv"))
+
+# ################## read DE genes results from analysis ########################
+withBile <- read_csv("/scicomp/home-pure/rwo8/workdir/rna_seq_oxy_bile_data_combined/output/tables/25HC_vs_ethanol_yesBile_infected_DE_genes.csv")
+
+noBile <- read_csv( "/scicomp/home-pure/rwo8/workdir/rna_seq_oxy_bile_data_combined/output/tables/25HC_vs_ethanol_noBile_infected_DE_genes.csv")
+
+# ################## obtain DE genes ######################################################
+up_with <- withBile %>% subset(padj < 0.05 & log2FoldChange > 1)
+up_no <- noBile %>% subset(padj < 0.05 & log2FoldChange > 1)
+
+down_with <- withBile %>% subset(padj < 0.05 & log2FoldChange < -1)
+down_no <- noBile %>% subset(padj < 0.05 & log2FoldChange < -1)
+
+# ################## get up-regulated genes intersected/distinct in bile vs. no Bile ##############################
+int_with_up <- up_no %>% subset(ENSEMBL %in% intersect(up_with$ENSEMBL, up_no$ENSEMBL))
+print(int_with_up$symbol)
+write.table(int_with_up %>% select(symbol) %>% distinct() , "/scicomp/home-pure/rwo8/workdir/int_with_up_gene_list_25HC_v_ethanol.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\n")
+
+noBile_up_unique <- up_no %>% subset(!ENSEMBL %in% intersect(up_with$ENSEMBL, up_no$ENSEMBL))
+print(noBile_up_unique$symbol)
+write.table(noBile_up_unique %>% select(symbol) %>% distinct() , "/scicomp/home-pure/rwo8/workdir/noBile_up_unique_gene_list_25HC_v_ethanol.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\n")
+
+
+withBile_up_unique <- up_with %>% subset(!ENSEMBL %in% intersect(up_with$ENSEMBL, up_no$ENSEMBL))
+print(withBile_up_unique$symbol)
+write.table(withBile_up_unique %>% select(symbol) %>% distinct() , "/scicomp/home-pure/rwo8/workdir/withBile_up_unique_gene_list_25HC_v_ethanol.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\n")
+
+# ################## get down-regulated genes intersected/distinct in bile vs. no Bile ############################
+#
+int_with_down <- withBile %>% subset(ENSEMBL %in% intersect(down_with$ENSEMBL, down_no$ENSEMBL))
+print(int_with_down$symbol)
+write.table(int_with_down %>% select(symbol) %>% distinct() , "/scicomp/home-pure/rwo8/workdir/int_with_down_gene_list_25HC_v_ethanol.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\n")
+
+
+noBile_down_unique <- down_no %>% subset(!ENSEMBL %in% intersect(down_with$ENSEMBL, down_no$ENSEMBL))
+print(noBile_down_unique$symbol)
+write.table(noBile_down_unique %>% select(symbol) %>% distinct() , "/scicomp/home-pure/rwo8/workdir/noBile_down_unique_list_25HC_v_ethanol.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\n")
+
+
+withBile_down_unique <- down_with %>% subset(!ENSEMBL %in% intersect(down_with$ENSEMBL, down_no$ENSEMBL))
+print(withBile_down_unique$symbol)
+write.table(withBile_down_unique %>% select(symbol) %>% distinct() , "/scicomp/home-pure/rwo8/workdir/withBile_down_unique_list_25HC_v_ethanol.txt", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\n")
+
+
+#
+# ################## plot venn diagram ############################
+
+library(ggvenn)
+library("venneuler")
+library("VennDiagram")
+
+tiff(file.path(fig_path, "upregulate_bile_vs_noBile_25HC_vs_Ethanol_GII4_VENN.tiff"))
+grid.newpage()
+p <- VennDiagram::draw.pairwise.venn(area1  = length(up_with$ENSEMBL),area2 = length(up_no$ENSEMBL), cross.area = length(intersect(up_with$ENSEMBL, up_no$ENSEMBL)), fill = c( "lightblue", "orange"), category = c("with Bile", "w/o Bile"), lty = "blank", print.mode=c("raw", "percent"), alpha = 0.5, cat.pos=c(180, 180))
+grid.draw(p)
+dev.off()
+
+tiff(file.path(fig_path, "downregulate_bile_vs_noBile_25HC_vs_Ethanol_GII4_VENN.tiff"))
+grid.newpage()
+p <- VennDiagram::draw.pairwise.venn(area1  = length(down_with$ENSEMBL),area2 = length(down_no$ENSEMBL), cross.area = length(intersect(down_with$ENSEMBL, down_no$ENSEMBL)), fill = c("lightblue", "orange"), category = c("with Bile", "w/o Bile"),  lty = "blank", print.mode=c("raw", "percent"), cat.pos=c(180, 180))
+grid.draw(p)
+dev.off()
+
+```
+
+### 3.1) plot MA 
+```{r}
+
+library(ggplot2)
+library(scales)
+library(edgeR)
+
+deseqDF <- as.data.frame(resLFCordered)
+
+
+head(deseqDF,2)
+
+deseqDF$significant <- ifelse(deseqDF$padj < 0.05 , "Sig", "Non-Sig") 
+
+ggplot(deseqDF, aes(log2(cpm(baseMean)), log2FoldChange, color=significant))+
+  geom_point(size=1)+
+  geom_hline(yintercept = 0, color="gray", size=1.5)+
+  scale_color_manual(values=c("gray", "purple"))
+
+```
+
+### 3.1) volcano plot
+
+```{r}
+
+deseqDF <- as.data.frame(resLFCordered)
+
+deseqDF$Comparison <- "Not significant"
+
+deseqDF$Comparison[deseqDF$log2FoldChange > 1 & deseqDF$padj < 0.05] <- "Up-regulated"
+deseqDF$Comparison[deseqDF$log2FoldChange < -1 & deseqDF$padj < 0.05] <- "Down-regulated"
+
+deseqDF[deseqDF$Comparison != "Not significant",]
+
+deseqDF$Comparison <- factor(deseqDF$Comparison, levels = c("Not significant",  "Up-regulated","Down-regulated"))
+
+gene_list_immune <- c( "IFIT1", "ISG15","MX1", "MX2", "IFITM1", "DDX54", "DDX60")
+gene_list_choles <- c("CYP3A4", "CYP27A1", "ABCG1", "CH25H", "ABCA1" )
+
+deseqDF[deseqDF$symbol %in% c(gene_list_immune,gene_list_choles ),]
+
+deseqDF$Immune <- NA
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[c(deseqDF$symbol %in% gene_list_immune) ,]$Immune <- deseqDF[c(deseqDF$symbol %in% gene_list_immune ),]$symbol
+deseqDF$Cholesterol <- NA
+deseqDF[c(deseqDF$symbol %in% gene_list_choles) ,]$Cholesterol <- deseqDF[c(deseqDF$symbol %in% gene_list_choles ),]$symbol
+
+
+deseqDF$DE.genes <- NA
+high_change <- 5
+high_padj <- 1e-20
+gene_high <- deseqDF %>% subset(abs(log2FoldChange) >high_change | padj < high_padj) %>% dplyr::select(symbol) %>% unlist()
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change),]$DE.genes <- deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) ,]$symbol
+
+# add a tag (for color in plot) for immune related and cholesterol related gene labels
+deseqDF <- deseqDF %>% mutate(labels = mapply(function(x,y,z){
+  if(is.na(x) & is.na(y) & is.na(z)){
+    NA
+  }else if(!is.na(x)){
+    x
+  }else if(!is.na(y)){
+    y
+  }else{
+    NA
+  }
+}, Immune, Cholesterol, DE.genes)) %>% mutate(label.tag = mapply(function(x,y,z){
+  if(is.na(x) & is.na(y) & is.na(z)){
+    NA
+  }else if(!is.na(x)){
+    "Immune"
+  }else if(!is.na(y)){
+    "Cholesterol"
+  }else{
+    NA
+  }
+}, Immune, Cholesterol, DE.genes))
+
+
+library(ggrepel)
+library(ggnewscale)
+vp <-ggplot(deseqDF, aes(x = log2FoldChange, y = -log10(padj), color=Comparison,label=symbol))+
+  geom_point()+
+  theme_bw()+
+  geom_vline(xintercept = c(-1,1), col="gray", linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), col="gray", linetype = "dashed")+
+  scale_color_manual(values = c("gray","orange","purple"))+
+  geom_text_repel(aes(label=DE.genes), color="black")+
+  new_scale_color()+
+  geom_label_repel(aes(label=labels, color=label.tag),point.padding = unit(1e-10, "mm") ,force=0.5, max.overlaps=getOption("ggrepel.max.overlaps", default = 100))+
+   scale_color_manual(values = c("blue","red"),na.translate = F)+
+  theme(axis.text = element_text(size=12))
+
+vp
+# ggsave(file.path(fig_path, paste0("25HC_vs_ethanol_",bile ,"Bile_infected_volcano.tiff")), vp, height =7, width = 9, dpi=500)
+
+
+```
+
+
+### 3.1) plot heatmap
+
+
+
+```{r}
+library(pheatmap)
+library(DESeq2)
+library(gridExtra)
+library(grid)
+library(seriation)
+library(dendextend)
+
+rld <- vst(dds.deseq, blind=FALSE, fitType='local')
+
+# DE_genes <- rownames(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1,])
+DE_genes <- rownames(resLFCordered[resLFCordered$symbol %in% c(gene_list_immune, gene_list_choles),])
+m <- assay(rld)[rownames(assay(rld)) %in% DE_genes,]
+topVarGenes <- order(rowVars(m), decreasing=TRUE)
+m1 <- m[topVarGenes,]
+
+
+m_anot<- left_join(as.data.frame(m1) %>% rownames_to_column(), data.frame(resLFCordered)%>% rownames_to_column(), by="rowname") %>% mutate(label = paste0(symbol, "(", ENSEMBL,")")) %>% subset(!is.na(symbol))
+rownames(m_anot) <- make.unique(m_anot$symbol)
+m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol" ,"ENSEMBL", "label"))
+
+# m_anot <- m_anot %>% group_by(symbol) %>% mutate(symbol_2 = 1:n()) %>% mutate(symbol_2 = ifelse(symbol_2==1, "", paste0("-dup", symbol_2))) %>% mutate(symbol_3 = paste0(symbol, symbol_2)) %>% as.data.frame()
+# rownames(m_anot) <- m_anot$symbol_3
+# m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol","symbol_2","symbol_3" ,"ENSEMBL", "label"))
+
+heat_matrix <- as.matrix(m_anot_df)
+ 
+anot_table<- metadata_oxy_bile %>% column_to_rownames(var="names") %>% dplyr::select(c("pretreatment", "Bile"))
+anot_color <- list(Bile=c(yes="orange"))
+
+tiff(file.path(fig_path, paste0("25HC_vs_ethanol_",bile ,"Bile_infected_heatmap.tiff")), width = 1500, height=1500,res=300)
+# tiff(file.path(fig_path, paste0(oxy, "vuntreated_",vir, "_DEgenes_heatmap.tiff")), width = 2000, height=1500,res=300)
+
+
+# The pheatmap with the same clustering of heatmaply
+heat <- pheatmap(heat_matrix,annotation = anot_table, fontsize_row=7, annotation_colors=anot_color)
+heat
+# add.flag(heat,kept.labels = c(gene_list_immune, gene_list_choles),repel.degree = 0.3)
+
+dev.off()
+
+
+```
+
+
+## 4) Fourth Comparison: compare untreated_uninfected vs. 25HC treated GII4 infected - w/ or w/o Bile - infected
+- control samples vs. infected and treated samples
+```{r}
+bile <- "yes"
+
+metadate_filter <- metadata_oxy_bile %>% subset((c(pretreatment == "25HC") & Bile == bile) | (infection == "uninfected" & Bile == bile))
+samples_filtered <- samples[samples %in% metadate_filter$names]
+
+sample.number = seq(1,length(samples_filtered),1)
+
+metadata_oxy_bile$infection <- factor(metadata_oxy_bile$infection, levels = c("uninfected","GII.4")) 
+metadata_oxy_bile$pretreatment <- factor(metadata_oxy_bile$pretreatment, levels = c("untreated", "ethanol","25HC")) 
+metadata_oxy_bile$Bile <- factor(metadata_oxy_bile$Bile, levels = c("no","yes")) 
+
+metadate_filter
+```
+
+### 4) check transcript quantification file exist
+```{r}
+
+trans.quant.files <- file.path(salmon_input, samples_filtered, "quant.sf")
+all(file.exists(trans.quant.files))
+```
+### 4) read gene quantification into R
+```{r}
+
+library(tximeta)
+library(DESeq2)
+
+coldata <- data.frame(files = trans.quant.files) %>% mutate(names = sapply(files, function(x){
+  s <-  unlist(strsplit(x, "/", fixed=TRUE))
+  s[length(s)-1]
+}))
+
+
+
+coldata_anot <- left_join(coldata, metadata_oxy_bile, by="names", stringAsFactors=FALSE)
+
+se <- tximeta(coldata_anot)
+
+# retrieveDb(se)
+# colData(se)
+# assayNames(se)
+# seqinfo(se)
+rowRanges(se)
+```
+
+### 4) summarise transcript expression to gene expression
+```{r}
+
+gse <- summarizeToGene(se)
+
+ddsTxi <- DESeqDataSet(gse, ~ infection)
+
+```
+### 4) deseq pca
+```{r}
+rlg <- rlog(ddsTxi, blind = TRUE)
+
+deseq_pca <- plotPCA(rlg, returnData = TRUE, intgroup=c("pretreatment", "infection"))
+
+percentVar <- round(100 * attr(deseq_pca, "percentVar"))
+
+
+pcap<- ggplot(deseq_pca, aes(x=PC1, PC2, color=pretreatment, label=name))+
+  geom_point(size=4)+
+  theme_bw()+
+  xlab(paste0("PC1 (",percentVar[1],"%)")) +
+  ylab(paste0("PC2 (",percentVar[2],"%)")) 
+pcap
+ggsave(file.path(fig_path, paste0("25HC_GII4_vs_untreated_uninfected_", bile,"Bile_pca_deseq.tiff")), pcap, dpi=300, height = 5, width = 7)
+
+# plotly::ggplotly(pcap)
+```
+
+### 4.1) DESeq analysis
+```{r}
+contrast <- c("infection", "GII.4","uninfected")
+
+contrast_str <- paste(contrast[1], contrast[2], "vs",contrast[3], sep="_")
+
+dds.deseq <- DESeq(ddsTxi, test="Wald")
+
+resultsNames(dds.deseq)
+
+res <- DESeq2::results(dds.deseq,contrast = contrast,independentFiltering = TRUE, alpha =0.05, pAdjustMethod = "BH")
+
+plotDispEsts(dds.deseq)
+```
+
+### 4.1) difference at individual time point
+```{r}
+contrast_str %in% resultsNames(dds.deseq)
+
+resLFC <- lfcShrink(dds.deseq, coef = paste0(contrast_str, collapse = "_"),type="apeglm", res=res)
+
+plotDispEsts(dds.deseq)
+
+
+resLFCordered <- resLFC[order(resLFC$padj) & !is.na(resLFC$padj),]
+summary(resLFCordered, alpha=0.05)
+sum(resLFCordered$padj < 0.05, na.rm =TRUE)
+nrow(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1 & !is.na(resLFCordered$padj),])
+
+```
+
+### get gene info for DE genes
+```{r}
+
+options(connectionObserver = NULL)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+columns(org.Hs.eg.db)
+
+ens.str <- rownames(resLFCordered)
+
+resLFCordered$symbol <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="SYMBOL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+resLFCordered$ENSEMBL <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="ENSEMBL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+head(resLFCordered,2)
+
+
+```
+
+### 4.1) write DE genes to file
+```{r}
+deseqDF <- as.data.frame(resLFCordered) %>% rownames_to_column() 
+gene_count <- data.frame(assay(ddsTxi)) %>% rownames_to_column()
+
+de_genes_write_df <- left_join(gene_count, deseqDF, by="rowname")%>% mutate(FoldChange = 2^log2FoldChange) %>% arrange(padj) %>% dplyr::select(-c(ENSEMBL))%>% dplyr::rename(ENSEMBL=rowname) 
+
+write.csv(de_genes_write_df, file.path(tab_path, paste0("25HC_GII4_vs_untreated_uninfected_", bile,"Bile_DE_genes.csv")))
+
+
+gene_count %>% subset(rowname == "ENSG00000137869")
+```
+
+### 4.1) plot MA 
+```{r}
+
+library(ggplot2)
+library(scales)
+library(edgeR)
+
+deseqDF <- as.data.frame(resLFCordered)
+
+
+head(deseqDF,2)
+
+deseqDF$significant <- ifelse(deseqDF$padj < 0.05 , "Sig", "Non-Sig") 
+
+ggplot(deseqDF, aes(log2(cpm(baseMean)), log2FoldChange, color=significant))+
+  geom_point(size=1)+
+  geom_hline(yintercept = 0, color="gray", size=1.5)+
+  scale_color_manual(values=c("gray", "purple"))
+
+```
+
+### 4.1) volcano plot
+
+```{r}
+
+
+deseqDF <- as.data.frame(resLFCordered)
+
+deseqDF$Comparison <- "Not significant"
+
+deseqDF$Comparison[deseqDF$log2FoldChange > 1 & deseqDF$padj < 0.05] <- "Up-regulated"
+deseqDF$Comparison[deseqDF$log2FoldChange < -1 & deseqDF$padj < 0.05] <- "Down-regulated"
+
+deseqDF[deseqDF$Comparison != "Not significant",]
+
+deseqDF$Comparison <- factor(deseqDF$Comparison, levels = c("Not significant",  "Up-regulated","Down-regulated"))
+
+gene_list <- c("CYP3A4", "IFIT1", "IFIT2", "IFIT5", "OAS2", "MX1")
+
+deseqDF$delabel2 <- NA
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[c(deseqDF$symbol %in% gene_list ),]$delabel2 <- deseqDF[c(deseqDF$symbol %in% gene_list ),]$symbol
+
+deseqDF$delabel <- NA
+high_change <- 5
+high_padj <- 1e-5
+gene_high <- deseqDF %>% subset(abs(log2FoldChange) >high_change | padj < high_padj) %>% dplyr::select(symbol) %>% unlist()
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) | (deseqDF$symbol %in% gene_list),]$delabel <- deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) | (deseqDF$symbol %in% gene_list),]$symbol
+
+
+library(ggrepel)
+vp <-ggplot(deseqDF, aes(x = log2FoldChange, y = -log10(padj), color=Comparison, label=symbol))+
+  geom_point()+
+  theme_bw()+
+  geom_vline(xintercept = c(-1,1), col="gray", linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), col="gray", linetype = "dashed")+
+    scale_color_manual(values = c("gray", "orange","purple"))+
+  geom_text_repel(aes(label=delabel), color="black")+
+  theme(axis.text = element_text(size=12))
+
+vp
+ggsave(file.path(fig_path, paste0("25HC_GII4_vs_untreated_uninfected_", bile,"Bile_volcano.tiff")), vp, height = 7, width = 9, dpi=300)
+
+
+```
+
+
+### 4.1) plot heatmap
+
+
+
+```{r}
+library(pheatmap)
+library(DESeq2)
+library(gridExtra)
+library(grid)
+library(seriation)
+library(dendextend)
+
+rld <- DESeq2::vst(dds.deseq, blind=FALSE, fitType='local')
+
+DE_genes <- rownames(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1,])
+m <- assay(rld)[rownames(assay(rld)) %in% DE_genes,]
+topVarGenes <- head(order(rowVars(m), decreasing=TRUE),50)
+m1 <- m[topVarGenes,]
+
+
+m_anot<- left_join(as.data.frame(m1) %>% rownames_to_column(), data.frame(resLFCordered)%>% rownames_to_column(), by="rowname") %>% mutate(label = paste0(symbol, "(", ENSEMBL,")")) %>% subset(!is.na(symbol))
+rownames(m_anot) <- m_anot$label
+m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol" ,"ENSEMBL", "label"))
+
+# m_anot <- m_anot %>% group_by(symbol) %>% mutate(symbol_2 = 1:n()) %>% mutate(symbol_2 = ifelse(symbol_2==1, "", paste0("-dup", symbol_2))) %>% mutate(symbol_3 = paste0(symbol, symbol_2)) %>% as.data.frame()
+# rownames(m_anot) <- m_anot$symbol_3
+# m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol","symbol_2","symbol_3" ,"ENSEMBL", "label"))
+
+heat_matrix <- as.matrix(m_anot_df)
+ 
+anot_table<- metadata_oxy_bile %>% column_to_rownames(var="names") %>% dplyr::select(c("infection", "pretreatment","Bile"))
+
+tiff(file.path(fig_path, paste0("25HC_GII4_vs_untreated_uninfected_", bile,"Bile_heatmap.tiff")), width = 2500, height=2500,res=300)
+# tiff(file.path(fig_path, paste0(oxy, "vuntreated_",vir, "_DEgenes_heatmap.tiff")), width = 2000, height=1500,res=300)
+
+# The pheatmap with the same clustering of heatmaply
+pheatmap(heat_matrix,annotation = anot_table, color = c(rev(RColorBrewer::brewer.pal(8,"Blues"))[c(3,5,8)],RColorBrewer::brewer.pal(8,"YlOrRd")), fontsize_row=7)
+
+# add.flag(heat,kept.labels = gene_list,repel.degree = 0.3)
+
+dev.off()
+
+
+```
+
+## 5) Fifth Comparison: Bile vs. no Bile - infected-25HC
+- since all **uninfected** samples were **untreated**, we will only use **untreated infected** samples in this formula
+```{r}
+pretreat <- "25HC" # untreated or 25 HC
+infect <- "GII.4"
+
+metadate_filter <- metadata_oxy_bile %>% subset(pretreatment == pretreat & infection == infect )
+samples_filtered <- samples[samples %in% metadate_filter$names]
+
+sample.number = seq(1,length(samples_filtered),1)
+
+metadata_oxy_bile$Bile <- factor(metadata_oxy_bile$Bile, levels = c("no","yes")) 
+
+metadate_filter
+```
+## 5) check transcript quantification file exist
+```{r}
+
+trans.quant.files <- file.path(salmon_input, samples_filtered, "quant.sf")
+all(file.exists(trans.quant.files))
+```
+### 1) read gene quantification into R
+```{r}
+
+
+coldata <- data.frame(files = trans.quant.files) %>% mutate(names = sapply(files, function(x){
+  s <-  unlist(strsplit(x, "/", fixed=TRUE))
+  s[length(s)-1]
+}))
+
+
+
+coldata_anot <- left_join(coldata, metadata_oxy_bile, by="names", stringAsFactors=FALSE)
+
+se <- tximeta(coldata_anot)
+
+# retrieveDb(se)
+# colData(se)
+# assayNames(se)
+# seqinfo(se)
+rowRanges(se)
+```
+
+### 4) summarise transcript expression to gene expression
+```{r}
+
+gse <- summarizeToGene(se)
+
+ddsTxi <- DESeqDataSet(gse, ~ Bile)
+
+```
+
+
+
+### 4) deseq pca
+```{r}
+rlg <- rlog(ddsTxi, blind = TRUE)
+
+deseq_pca <- plotPCA(rlg, returnData = TRUE, intgroup=c("Bile"))
+
+percentVar <- round(100 * attr(deseq_pca, "percentVar"))
+
+
+pcap<- ggplot(deseq_pca, aes(x=PC1, PC2, color=Bile, label=name))+
+  geom_point(size=4)+
+  theme_bw()+
+  
+  xlab(paste0("PC1 (",percentVar[1],"%)")) +
+  ylab(paste0("PC2 (",percentVar[2],"%)")) 
+pcap
+ggsave(file.path(fig_path, paste0("Bile_vs_noBile_GII.4_25HC_pca_deseq.tiff")), pcap, dpi=300, height = 5, width = 7)
+
+# plotly::ggplotly(pcap)
+```
+
+### 4.1) DESeq analysis
+```{r}
+contrast <- c("Bile",  "yes","no")
+
+contrast_str <- paste(contrast[1], contrast[2], "vs",contrast[3], sep="_")
+
+dds.deseq <- DESeq(ddsTxi, test="Wald")
+
+resultsNames(dds.deseq)
+
+res <- DESeq2::results(dds.deseq,contrast = contrast,independentFiltering = TRUE, alpha =0.05, pAdjustMethod = "BH")
+
+plotDispEsts(dds.deseq)
+```
+
+### 4.1) difference at individual time point
+```{r}
+contrast_str %in% resultsNames(dds.deseq)
+
+resLFC <- lfcShrink(dds.deseq, coef = paste0(contrast_str, collapse = "_"),type="apeglm", res=res)
+
+plotDispEsts(dds.deseq)
+
+
+resLFCordered <- resLFC[order(resLFC$padj) & !is.na(resLFC$padj),]
+summary(resLFCordered, alpha=0.05)
+sum(resLFCordered$padj < 0.05, na.rm =TRUE)
+nrow(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1 & !is.na(resLFCordered$padj),])
+
+```
+
+### get gene info for DE genes
+```{r}
+
+options(connectionObserver = NULL)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+columns(org.Hs.eg.db)
+
+ens.str <- rownames(resLFCordered)
+
+resLFCordered$symbol <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="SYMBOL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+resLFCordered$ENSEMBL <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="ENSEMBL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+head(resLFCordered,2)
+
+
+```
+
+### 4.1) write DE genes to file
+```{r}
+deseqDF <- as.data.frame(resLFCordered) %>% rownames_to_column() 
+gene_count <- data.frame(assay(ddsTxi)) %>% rownames_to_column()
+
+de_genes_write_df <- left_join(gene_count, deseqDF, by="rowname")%>% mutate(FoldChange = 2^log2FoldChange) %>% arrange(padj) %>% dplyr::select(-c(ENSEMBL))%>% dplyr::rename(ENSEMBL=rowname) 
+
+write.csv(de_genes_write_df, file.path(tab_path, paste0("Bile_vs_noBile_GII.4_25HC_DE_genes.csv")))
+
+
+gene_count %>% subset(rowname == "ENSG00000137869")
+```
+
+### 1.1) plot MA 
+```{r}
+
+library(ggplot2)
+library(scales)
+library(edgeR)
+
+deseqDF <- as.data.frame(resLFCordered)
+
+
+head(deseqDF,2)
+
+deseqDF$significant <- ifelse(deseqDF$padj < 0.05 , "Sig", "Non-Sig") 
+
+ggplot(deseqDF, aes(log2(cpm(baseMean)), log2FoldChange, color=significant))+
+  geom_point(size=1)+
+  geom_hline(yintercept = 0, color="gray", size=1.5)+
+  scale_color_manual(values=c("gray", "purple"))
+
+```
+
+### 5.1) volcano plot
+
+```{r}
+
+
+deseqDF <- as.data.frame(resLFCordered)
+
+deseqDF$Comparison <- "Not significant"
+
+deseqDF$Comparison[deseqDF$log2FoldChange > 1 & deseqDF$padj < 0.05] <- "Up-regulated"
+deseqDF$Comparison[deseqDF$log2FoldChange < -1 & deseqDF$padj < 0.05] <- "Down-regulated"
+
+deseqDF[deseqDF$Comparison != "Not significant",]
+
+deseqDF$Comparison <- factor(deseqDF$Comparison, levels = c("Not significant",  "Up-regulated","Down-regulated"))
+
+gene_list_immune <- c( "IFIT1", "ISG15","MX1", "MX2", "IFITM1", "DDX54", "DDX60")
+gene_list_choles <- c("CYP3A4", "CYP27A1", "ABCG1", "CH25H", "ABCA1" )
+deseqDF[deseqDF$symbol %in% c(gene_list_immune,gene_list_choles ),]
+
+deseqDF$Immune <- NA
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[c(deseqDF$symbol %in% gene_list_immune) ,]$Immune <- deseqDF[c(deseqDF$symbol %in% gene_list_immune ),]$symbol
+deseqDF$Cholesterol <- NA
+deseqDF[c(deseqDF$symbol %in% gene_list_choles) ,]$Cholesterol <- deseqDF[c(deseqDF$symbol %in% gene_list_choles ),]$symbol
+
+
+deseqDF$DE.genes <- NA
+high_change <- 5
+high_padj <- 1e-5
+gene_high <- deseqDF %>% subset(abs(log2FoldChange) >high_change | padj < high_padj) %>% dplyr::select(symbol) %>% unlist()
+# add label to the genes that are both significantly expressed and also in the list of interested gene
+deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change),]$DE.genes <- deseqDF[(deseqDF$symbol %in% gene_high == TRUE &  deseqDF$padj < high_padj | abs(deseqDF$log2FoldChange) >high_change) ,]$symbol
+
+# add a tag (for color in plot) for immune related and cholesterol related gene labels
+deseqDF <- deseqDF %>% mutate(labels = mapply(function(x,y,z){
+  if(is.na(x) & is.na(y) & is.na(z)){
+    NA
+  }else if(!is.na(x)){
+    x
+  }else if(!is.na(y)){
+    y
+  }else{
+    NA
+  }
+}, Immune, Cholesterol, DE.genes)) %>% mutate(label.tag = mapply(function(x,y,z){
+  if(is.na(x) & is.na(y) & is.na(z)){
+    NA
+  }else if(!is.na(x)){
+    "Immune"
+  }else if(!is.na(y)){
+    "Cholesterol"
+  }else{
+    NA
+  }
+}, Immune, Cholesterol, DE.genes))
+
+
+library(ggrepel)
+library(ggnewscale)
+vp <-ggplot(deseqDF, aes(x = log2FoldChange, y = -log10(padj), color=Comparison,label=symbol))+
+  geom_point()+
+  theme_bw()+
+  geom_vline(xintercept = c(-1,1), col="gray", linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), col="gray", linetype = "dashed")+
+  scale_color_manual(values = c("gray","orange","purple"))+
+  geom_text_repel(aes(label=DE.genes), color="black")+
+  new_scale_color()+
+  geom_label_repel(aes(label=labels, color=label.tag),point.padding = unit(1e-10, "mm") ,force=0.5, max.overlaps=getOption("ggrepel.max.overlaps", default = 100))+
+   scale_color_manual(values = c("blue","red"),na.translate = F)+
+  theme(axis.text = element_text(size=12))
+
+vp
+ggsave(file.path(fig_path, paste0("Bile_vs_noBile_GII.4_25HC_volcano.tiff")), vp, height = 7, width = 9, dpi=300)
+
+
+```
+
+
+### 5.1) plot heatmap
+
+
+
+```{r}
+library(pheatmap)
+library(DESeq2)
+library(gridExtra)
+library(grid)
+library(seriation)
+library(dendextend)
+
+rld <- vst(dds.deseq, blind=FALSE, fitType='local')
+
+# DE_genes <- rownames(resLFCordered[resLFCordered$padj < 0.05 & abs(resLFCordered$log2FoldChange) > 1,])
+DE_genes <- rownames(resLFCordered[resLFCordered$symbol %in% c(gene_list_immune, gene_list_choles),])
+m <- assay(rld)[rownames(assay(rld)) %in% DE_genes,]
+topVarGenes <- order(rowVars(m), decreasing=TRUE)
+m1 <- m[topVarGenes,]
+
+
+m_anot<- left_join(as.data.frame(m1) %>% rownames_to_column(), data.frame(resLFCordered)%>% rownames_to_column(), by="rowname") %>% mutate(label = paste0(symbol, "(", ENSEMBL,")")) %>% subset(!is.na(symbol))
+rownames(m_anot) <- make.unique(m_anot$symbol)
+m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol" ,"ENSEMBL", "label"))
+
+# m_anot <- m_anot %>% group_by(symbol) %>% mutate(symbol_2 = 1:n()) %>% mutate(symbol_2 = ifelse(symbol_2==1, "", paste0("-dup", symbol_2))) %>% mutate(symbol_3 = paste0(symbol, symbol_2)) %>% as.data.frame()
+# rownames(m_anot) <- m_anot$symbol_3
+# m_anot_df <- m_anot %>% dplyr::select(-c("rowname", "baseMean", "log2FoldChange", "lfcSE", "pvalue", "padj", "symbol","symbol_2","symbol_3" ,"ENSEMBL", "label"))
+
+heat_matrix <- as.matrix(m_anot_df)
+ 
+anot_table<- metadata_oxy_bile %>% column_to_rownames(var="names") %>% dplyr::select(c("pretreatment", "Bile"))
+anot_color <- list(Bile=c(yes="orange", no="lightblue"))
+
+tiff(file.path(fig_path, paste0("Bile_vs_noBile_GII.4_25HC_heatmap.tiff")),width = 1500, height=1500,res=300)
+# tiff(file.path(fig_path, paste0(oxy, "vuntreated_",vir, "_DEgenes_heatmap.tiff")), width = 2000, height=1500,res=300)
+
+heat <- pheatmap(heat_matrix, annotation = anot_table, color = c(RColorBrewer::brewer.pal(8,"Blues")[c(8,5,3)],RColorBrewer::brewer.pal(8,"YlOrRd")), fontsize_row=7, silent = TRUE)
+
+col_dend <- heat[[2]]
+col_dend <- rotate(col_dend, order = rev(colnames(heat_matrix)[get_order(col_dend)]))
+
+# The pheatmap with the same clustering of heatmaply
+pheatmap(heat_matrix, cluster_cols=as.hclust(col_dend), annotation = anot_table, fontsize_row=7)
+
+# add.flag(heat,kept.labels = gene_list,repel.degree = 0.3)
+
+dev.off()
+
+
+```
+
+# ADD: barplot shows gene expression across conditions
+
+#### get samples from all conditions
+```{r}
+
+metadata_oxy_bile$infection <- factor(metadata_oxy_bile$infection, levels = c("uninfected","GII.4")) 
+metadata_oxy_bile$Bile <- factor(metadata_oxy_bile$Bile, levels = c("no","yes")) 
+
+samples_filtered <- samples[samples %in% metadata_oxy_bile$names]
+
+samples_filtered
+```
+
+### check transcript quantification file exist
+```{r}
+
+trans.quant.files <- file.path(salmon_input, samples_filtered, "quant.sf")
+all(file.exists(trans.quant.files))
+```
+
+### read gene quantification into R
+```{r}
+
+
+coldata <- data.frame(files = trans.quant.files) %>% mutate(names = sapply(files, function(x){
+  s <-  unlist(strsplit(x, "/", fixed=TRUE))
+  s[length(s)-1]
+}))
+
+
+
+coldata_anot <- left_join(coldata, metadata_oxy_bile, by="names", stringAsFactors=FALSE)
+
+se <- tximeta(coldata_anot)
+
+
+```
+### summarise transcript expression to gene expression
+```{r}
+
+gse <- summarizeToGene(se)
+
+ddsTxi <- DESeqDataSet(gse, ~ infection + pretreatment + Bile)
+```
+
+### format table, match metadata
+```{r}
+library(tidyr)
+rlg <- rlog(ddsTxi, blind = TRUE)
+
+gene_expression_df <- as.data.frame(assay(rlg)) %>% rownames_to_column() %>% pivot_longer(colnames(.)[colnames(.) != "rowname"], names_to="names", values_to="RNAseq Gene Expression")
+
+gene_count_anot <- left_join(gene_expression_df, metadata_oxy_bile, by="names")
+
+gene_count_anot.1 <- gene_count_anot %>% subset(`RNAseq Gene Expression` !=0)
+
+gene_count_anot_summary <- gene_count_anot.1 %>% group_by(infection, pretreatment, Bile, rowname) %>% summarise(avg_gene_exp = mean(`RNAseq Gene Expression`), sd=sd(`RNAseq Gene Expression`))
+
+```
+### get gene info for DE genes
+```{r}
+
+options(connectionObserver = NULL)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+columns(org.Hs.eg.db)
+
+ens.str <- gene_count_anot_summary$rowname
+
+gene_count_anot_summary$symbol <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="SYMBOL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+gene_count_anot_summary$ENSEMBL <- mapIds(org.Hs.eg.db,
+       keys=ens.str,
+       column="ENSEMBL",
+       keytype = "ENSEMBL",
+       multiVals = "first")
+
+head(gene_count_anot_summary,2)
+
+gene_count_anot_summary.1 <- gene_count_anot_summary %>% mutate(Bile = sapply(Bile, function(x){
+  ifelse(x == "yes", "(+)", "(-)")
+}))%>% mutate(treatment = paste(infection, pretreatment, Bile, sep=".")) 
+
+unique(gene_count_anot_summary.1$treatment)
+
+gene_count_anot_summary.1$treatment <- factor(gene_count_anot_summary.1$treatment, levels = c("uninfected.untreated.(-)", "uninfected.untreated.(+)","GII.4.untreated.(+)", "GII.4.ethanol.(+)" , "GII.4.25HC.(+)", "GII.4.untreated.(-)", "GII.4.ethanol.(-)", "GII.4.25HC.(-)"))
+```
+
+
+```{r}
+x <- "OAS1"
+plot_gene <- function(x){
+  gene_df <- plotCounts(ddsTxi, unique(gene_count_anot_summary.1[gene_count_anot_summary.1$symbol %in% c(x),]$ENSEMBL), intgroup = c("infection", "pretreatment", "Bile"), returnData = TRUE, normalized = TRUE) %>% as.data.frame() %>% group_by(pretreatment, Bile, infection) %>% summarise(avg_count=mean(count), sd = sd(count))  %>% mutate(Bile = sapply(Bile, function(x){
+  ifelse(x == "yes", "(+)", "(-)")
+})) %>% mutate(treatment = paste(infection, pretreatment, Bile, sep=".")) 
+  gene_df$treatment <- factor(gene_df$treatment, levels = c("uninfected.untreated.(-)", "uninfected.untreated.(+)","GII.4.untreated.(+)", "GII.4.ethanol.(+)" , "GII.4.25HC.(+)", "GII.4.untreated.(-)", "GII.4.ethanol.(-)", "GII.4.25HC.(-)"))
+  ggplot( gene_df, aes(x=treatment, y=avg_count))+
+    geom_bar(stat = "identity", position = "dodge")+
+    geom_errorbar( aes(x=treatment, ymin=avg_count-sd, ymax=avg_count+sd), color="red",alpha=0.9, width=0.5)+
+    theme_bw()+
+    labs(y="Average Read Count")+
+    theme(axis.text.x = element_text(angle=90, hjust=0.95, vjust=0.2))+
+    scale_y_continuous(limits = c(0, max(gene_df$avg_count) + max(gene_df$sd)))+
+    labs(x="Conditions", y = "Average normalized gene count")
+}
+
+plot_gene("CYP3A4")
+
+x <- c( "IFIT1","MX1","ISG15","CYP27A1","CYP3A4","ABCG1")
+plot_gene_list <- function(x){
+  gene_df <- do.call(rbind,lapply(x, function(x){
+    y <- unique(gene_count_anot_summary.1[gene_count_anot_summary.1$symbol %in% c(x),]$ENSEMBL)
+    df <- plotCounts(dds=ddsTxi,y,intgroup = c("infection", "pretreatment", "Bile"), returnData = TRUE, normalized = TRUE)
+    df$symbol <- x
+    df$ENSEMBL <- y
+    df
+    })) %>% group_by(pretreatment, Bile, infection, symbol) %>% summarise(avg_count=mean(count), sd = sd(count))  %>% mutate(Bile = sapply(Bile, function(x){
+  ifelse(x == "yes", "(+)", "(-)")
+})) %>% mutate(treatment = paste(infection, pretreatment, Bile, sep="."))
+  
+  gene_df$treatment <- factor(gene_df$treatment, levels = c("uninfected.untreated.(-)", "uninfected.untreated.(+)","GII.4.untreated.(+)", "GII.4.ethanol.(+)" , "GII.4.25HC.(+)", "GII.4.untreated.(-)", "GII.4.ethanol.(-)", "GII.4.25HC.(-)"))
+  
+gene_df
+}
+
+gene_df <- plot_gene_list(x)
+gene_df$symbol <- factor(gene_df$symbol,c( "IFIT1","MX1","ISG15","CYP27A1","CYP3A4","ABCG1"))
+
+plots <- ggplot( gene_df, aes(x=treatment, y=avg_count))+
+    geom_bar(stat = "identity", position = "dodge")+
+    geom_errorbar( aes(x=treatment, ymin=avg_count-sd, ymax=avg_count+sd), color="red",alpha=0.9, width=0.5)+
+    facet_wrap(~symbol, scales= "free_y", ncol=3)+
+    theme_bw()+
+    labs(y="Average Read Count")+
+    theme(axis.text.x = element_text(angle=90, hjust=0.95, vjust=0.2))+
+    labs(x="Conditions", y = "Average normalized gene count")
+
+
+
+
+ ggsave(file.path(fig_path, "interest_gene_bar_plots.tiff"), plots,dpi=300, height=7, width =12)
+
+
+```
